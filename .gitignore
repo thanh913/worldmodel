@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+data/
+artifacts/*
+!artifacts/autoencoder_result.png
+!artifacts/direct_rollout.png
+!artifacts/rollout.png
+!artifacts/rollout_h16.png
+dist/
+*.pyc
