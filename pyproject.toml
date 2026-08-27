@@ -1,18 +1,21 @@
 [project]
-name = "pong-wm"
+name = "atari-wm"
 version = "0.1.0"
-description = "A small action-conditioned latent world model for Pong"
+description = "A small action-conditioned latent world model for Atari"
 requires-python = ">=3.11"
 dependencies = [
     "ale-py>=0.11",
     "gymnasium>=1.1",
     "matplotlib>=3.9",
     "numpy>=2.0",
+    "opencv-python-headless>=4.11",
     "torch>=2.5",
 ]
 
 [project.scripts]
-pong-wm = "pong_wm.experiment:main"
+atari-wm-data = "atari_wm.data:main"
+atari-wm-train = "atari_wm.train:main"
+atari-wm-eval = "atari_wm.evaluate:main"
 
 [build-system]
 requires = ["hatchling"]
