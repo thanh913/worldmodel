@@ -8,8 +8,8 @@ dependencies = [
     "gymnasium>=1.1",
     "matplotlib>=3.9",
     "numpy>=2.0",
-    "opencv-python-headless>=4.11",
     "torch>=2.5",
+    "tqdm>=4.67",
 ]
 
 [project.scripts]

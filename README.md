@@ -21,13 +21,18 @@ Recommended params for each env:
 uv run atari-wm-data breakout \
   --train-episodes 2000 \
   --eval-episodes 30 \
-  --max-steps 2000
+  --max-steps 2000 \
+  --num-envs 8
 
 uv run atari-wm-data pong \
   --train-episodes 400 \
   --eval-episodes 10 \
-  --max-steps 2000
+  --max-steps 2000 \
+  --num-envs 8
 ```
+
+Data collection runs several native ALE environments in parallel. Omit
+`--num-envs` to use up to 8 CPU lanes automatically.
 
 
 ### Train
