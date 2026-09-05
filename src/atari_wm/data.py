@@ -29,6 +29,8 @@ class Episode:
     rng: np.random.Generator
     frames: list[np.ndarray]
     actions: list[int]
+    rewards: list[float]
+    continues: list[bool]
     lives: int
     needs_fire: bool = True
 
@@ -39,14 +41,25 @@ def new_episode(index, base_seed):
         rng=np.random.default_rng(base_seed + index),
         frames=[],
         actions=[],
+        rewards=[],
+        continues=[],
         lives=0,
     )
 
 
 def save_episode(episode, output_dir):
+    assert len(episode.frames) == len(episode.actions) + 1
+    assert len(episode.actions) == len(episode.rewards) == len(episode.continues)
     frames = torch.from_numpy(np.stack(episode.frames)).permute(0, 3, 1, 2).contiguous()
-    actions = torch.tensor(episode.actions, dtype=torch.uint8)
-    torch.save((frames, actions), output_dir / f"episode_{episode.index:04d}.pt")
+    torch.save(
+        {
+            "frames": frames,
+            "actions": torch.tensor(episode.actions, dtype=torch.uint8),
+            "rewards": torch.tensor(episode.rewards, dtype=torch.float32),
+            "continues": torch.tensor(episode.continues, dtype=torch.bool),
+        },
+        output_dir / f"episode_{episode.index:04d}.pt",
+    )
 
 
 def generate_split(game, output_dir, episode_count, max_steps, base_seed, num_envs=None):
@@ -98,7 +111,7 @@ def generate_split(game, output_dir, episode_count, max_steps, base_seed, num_en
                     else:
                         actions[lane] = episode.rng.choice(ATARI_ACTIONS)
 
-                observations, _, terminated, truncated, infos = env.step(actions)
+                observations, rewards, terminated, truncated, infos = env.step(actions)
                 for position, lane_value in enumerate(infos["env_id"]):
                     lane = int(lane_value)
                     episode = active[lane]
@@ -111,6 +124,8 @@ def generate_split(game, output_dir, episode_count, max_steps, base_seed, num_en
                         continue
 
                     episode.actions.append(int(actions[lane]))
+                    episode.rewards.append(float(rewards[position]))
+                    episode.continues.append(not bool(terminated[position]))
                     episode.frames.append(observations[position, 0].copy())
                     lives = int(infos["lives"][position])
                     if game == "breakout" and lives < episode.lives:
@@ -158,7 +173,9 @@ class HorizonDataset(torch.utils.data.Dataset):
         self.windows = []
 
         for episode_index, path in enumerate(sorted(Path(data_dir).glob("episode_*.pt"))):
-            frames, actions = torch.load(path, weights_only=True, mmap=True)
+            episode = torch.load(path, weights_only=True, mmap=True)
+            frames = episode["frames"]
+            actions = episode["actions"]
             self.episodes.append((frames, actions))
             window_count = len(frames) - self.window_size + 1
             self.windows.extend((episode_index, start) for start in range(window_count))

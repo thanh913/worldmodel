@@ -51,10 +51,7 @@ uv run atari-wm-train all --game breakout
 ### Evaluate
 
 ```bash
-uv run atari-wm-eval all \
-  --game breakout \
-  --samples 12 \
-  --batch-size 4
+uv run atari-wm-eval breakout --samples 12
 ```
 
 Images are written to `artifacts/<game>/eval/{autoencoder,rollouts}`.
