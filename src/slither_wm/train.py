@@ -1,4 +1,4 @@
-"""Train an Atari autoencoder and latent flow world model."""
+"""Train a Slither pixel autoencoder and latent flow world model."""
 
 from __future__ import annotations
 
@@ -13,10 +13,16 @@ from torch.optim import Adam, Optimizer
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from atari_wm.data import FrameDataset, GAMES
-from atari_wm.models import Autoencoder, WorldModel
+from slither_wm.data import FrameDataset, load_episode
+from slither_wm.models import Autoencoder, WorldModel, load_autoencoder
 from wm_common.runtime import (
     choose_device, collate_frame_batch, frames_to_float, prepare_step, use_amp,
+)
+from slither_wm.common import (
+    DATA_DIR,
+    ARTIFACT_DIR,
+    SEED,
+    metadata,
 )
 
 
@@ -27,11 +33,6 @@ from wm_common.tracking import (
 
 # Configuration
 
-DATA_DIR = Path("data")
-ARTIFACT_DIR = Path("artifacts")
-
-SEED = 42
-ACTION_COUNT = 18
 D_MODEL = 512
 N_LAYER = 4
 N_HEAD = 8
@@ -44,42 +45,6 @@ WM_BATCH_SIZE = 256
 AE_EPOCHS = 30
 WM_EPOCHS = 100
 LEARNING_RATE = 6e-4
-
-# Logging diagnostics; neither changes the training loss.
-BACKGROUND_SAMPLE_COUNT = 256
-FOREGROUND_THRESHOLD = 0.05
-
-
-# Shared utilities
-
-def game_paths(game: str) -> tuple[Path, Path, Path, Path]:
-    data_dir = DATA_DIR / game
-    artifact_dir = ARTIFACT_DIR / game
-    return (
-        data_dir / "train",
-        data_dir / "eval",
-        artifact_dir / "autoencoder.pt",
-        artifact_dir / "world_model.pt",
-    )
-
-
-# Autoencoder
-
-def foreground_mse(prediction: Tensor, target: Tensor, background: Tensor) -> Tensor:
-    """Measure moving-object error that global loss hides behind static pixels."""
-    squared_error = (prediction - target).square()
-    foreground = (target - background).abs().mean(dim=1, keepdim=True)
-    foreground = foreground > FOREGROUND_THRESHOLD
-    return (squared_error * foreground).sum() / (foreground.sum() * target.shape[1])
-
-
-def estimate_background(dataset: FrameDataset) -> Tensor:
-    """Use the median to estimate the static background."""
-    sample_count = min(BACKGROUND_SAMPLE_COUNT, len(dataset))
-    indices = torch.linspace(0, len(dataset) - 1, sample_count).long()
-    frames = torch.stack([dataset[int(index)] for index in indices])
-    frames = frames_to_float(frames, torch.device("cpu"))
-    return frames.median(dim=0).values
 
 
 # Keep this small backward pass on the caller thread; avoid engine handoff latency.
@@ -103,13 +68,12 @@ def autoencoder_step(
 def evaluate_autoencoder(
     autoencoder: Autoencoder,
     batches: DataLoader,
-    background: Tensor,
     device: torch.device,
     amp: bool = False,
 ) -> tuple[float, float]:
     autoencoder.eval()
     total_bce = torch.zeros((), device=device)
-    total_foreground_mse = torch.zeros((), device=device)
+    total_mse = torch.zeros((), device=device)
     frame_count = 0
 
     for frames in tqdm(batches, desc="AE eval", unit="batch", leave=False):
@@ -117,35 +81,46 @@ def evaluate_autoencoder(
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             logits, _ = autoencoder(frames)
             bce = F.binary_cross_entropy_with_logits(logits, frames)
-        fg_mse = foreground_mse(logits.sigmoid(), frames, background)
+        mse = F.mse_loss(logits.sigmoid().float(), frames)
 
         total_bce += bce * len(frames)
-        total_foreground_mse += fg_mse * len(frames)
+        total_mse += mse * len(frames)
         frame_count += len(frames)
 
-    return (total_bce / frame_count).item(), (total_foreground_mse / frame_count).item()
+    return (total_bce / frame_count).item(), (total_mse / frame_count).item()
 
 
-def train_autoencoder(game: str) -> None:
+def train_autoencoder(
+    *,
+    epochs=AE_EPOCHS,
+    batch_size=FRAME_BATCH_SIZE,
+    data_dir=DATA_DIR,
+    artifact_dir=ARTIFACT_DIR,
+) -> None:
     torch.manual_seed(SEED)
     device = choose_device()
     amp = use_amp(device)
+    train_dir, eval_dir = Path(data_dir) / "train", Path(data_dir) / "eval"
+    autoencoder_path = Path(artifact_dir) / "autoencoder.pt"
     step = prepare_step(partial(autoencoder_step, amp=amp), device)
-    train_dir, eval_dir, autoencoder_path, _ = game_paths(game)
-    print(f"training {game} autoencoder on {device}")
+    print(f"training autoencoder on {device}", flush=True)
 
     train_data = FrameDataset(train_dir)
     eval_data = FrameDataset(eval_dir)
     collate = partial(collate_frame_batch, pin_memory=device.type == "cuda")
     train_batches = DataLoader(
-        train_data, batch_size=FRAME_BATCH_SIZE, shuffle=True,
-        num_workers=0, collate_fn=collate,
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate,
     )
     eval_batches = DataLoader(
-        eval_data, batch_size=FRAME_BATCH_SIZE,
-        num_workers=0, collate_fn=collate,
+        eval_data,
+        batch_size=batch_size,
+        num_workers=0,
+        collate_fn=collate,
     )
-    background = estimate_background(train_data).to(device)
 
     autoencoder = Autoencoder().to(device)
     optimizer = Adam(autoencoder.parameters(), lr=LEARNING_RATE)
@@ -153,53 +128,61 @@ def train_autoencoder(game: str) -> None:
 
     preview = preview_frames(eval_data, device)
     with start_run(
-        game, "autoencoder", autoencoder_path.parent,
-        epochs=AE_EPOCHS, batch_size=FRAME_BATCH_SIZE, learning_rate=LEARNING_RATE,
+        "slither", "autoencoder", autoencoder_path.parent,
+        epochs=epochs, batch_size=batch_size, learning_rate=LEARNING_RATE,
         latent_dim=autoencoder.d_latent, image_shape=list(preview.shape[1:]),
         device=str(device), data_dir=str(train_dir.parent), seed=SEED,
     ) as run:
-        for epoch in range(1, AE_EPOCHS + 1):
+        for epoch in range(1, epochs + 1):
             autoencoder.train()
             total_bce = torch.zeros((), device=device)
-            total_foreground_mse = torch.zeros((), device=device)
+            total_mse = torch.zeros((), device=device)
             frame_count = 0
 
-            for frames in tqdm(train_batches, desc=f"AE {epoch}/{AE_EPOCHS}", unit="batch"):
+            for frames in tqdm(train_batches, desc=f"AE {epoch}/{epochs}", unit="batch"):
                 frames = frames_to_float(frames, device)
                 bce, logits = step(autoencoder, frames, optimizer)
                 with torch.no_grad():
-                    fg_mse = foreground_mse(logits.sigmoid(), frames, background)
+                    mse = F.mse_loss(logits.sigmoid().float(), frames)
 
                 total_bce += bce * len(frames)
-                total_foreground_mse += fg_mse * len(frames)
+                total_mse += mse * len(frames)
                 frame_count += len(frames)
 
             train_bce = (total_bce / frame_count).item()
-            train_fg_mse = (total_foreground_mse / frame_count).item()
-            eval_bce, eval_fg_mse = evaluate_autoencoder(
-                autoencoder, eval_batches, background, device, amp
+            train_mse = (total_mse / frame_count).item()
+            eval_bce, eval_mse = evaluate_autoencoder(
+                autoencoder, eval_batches, device, amp
             )
             print(
                 f"AE {epoch:02d} | "
-                f"train bce {train_bce:.6f} fg {train_fg_mse:.6f} | "
-                f"eval bce {eval_bce:.6f} fg {eval_fg_mse:.6f}"
+                f"train bce {train_bce:.6f} mse {train_mse:.6f} | "
+                f"eval bce {eval_bce:.6f} mse {eval_mse:.6f}"
             )
 
             run.log({
                 "epoch": epoch,
                 "train/loss": train_bce, "eval/loss": eval_bce,
-                "train/fg_mse": train_fg_mse, "eval/fg_mse": eval_fg_mse,
+                "train/mse": train_mse, "eval/mse": eval_mse,
                 "eval/reconstructions": reconstruction_image(autoencoder, preview, amp),
             }, step=epoch)
 
             if eval_bce < best_eval_bce:
                 best_eval_bce = eval_bce
-                torch.save(autoencoder.state_dict(), autoencoder_path)
+                torch.save(
+                    {
+                        "metadata": metadata(),
+                        "kind": "autoencoder",
+                        "state_dict": autoencoder.state_dict(),
+                    },
+                    autoencoder_path,
+                )
 
     print(f"saved best autoencoder to {autoencoder_path}")
 
 
 # Latent data
+
 
 class LatentSequenceDataset(Dataset):
     """Return contiguous transition sequences that stay within one episode."""
@@ -209,6 +192,8 @@ class LatentSequenceDataset(Dataset):
         episodes: list[tuple[Tensor, Tensor, Tensor, Tensor]],
         sequence_length: int,
     ) -> None:
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be positive")
         self.episodes = episodes
         self.sequence_length = sequence_length
         self.sequences = []
@@ -216,6 +201,11 @@ class LatentSequenceDataset(Dataset):
             self.sequences.extend(
                 (episode_index, start)
                 for start in range(len(latents) - sequence_length)
+            )
+
+        if not self.sequences:
+            raise ValueError(
+                f"No episode has {sequence_length} transitions; collect longer episodes or reduce --sequence-length"
             )
 
     def __len__(self) -> int:
@@ -239,14 +229,14 @@ def encode_episodes(
     data_dir: Path,
     autoencoder: Autoencoder,
     device: torch.device,
+    amp: bool = False,
 ) -> list[tuple[Tensor, Tensor, Tensor, Tensor]]:
     """Encode each saved episode once and keep its latents on CPU."""
     paths = sorted(data_dir.glob("episode_*.pt"))
-    amp = use_amp(device)
     episodes = []
 
     for path in tqdm(paths, desc=f"Encode {data_dir.name}", unit="episode"):
-        episode = torch.load(path, weights_only=True, mmap=True)
+        episode = load_episode(path)
         frames = episode["frames"]
         latent_chunks = []
         for start in range(0, len(frames), FRAME_BATCH_SIZE):
@@ -257,12 +247,14 @@ def encode_episodes(
         episodes.append(
             (
                 torch.cat(latent_chunks),
-                episode["actions"].to(torch.long).clone(),
-                episode["rewards"].to(torch.float32).clone(),
+                episode["actions"].clone(),
+                episode["rewards"].clone(),
                 episode["continues"].to(torch.float32).clone(),
             )
         )
 
+    if not episodes:
+        raise ValueError(f"{data_dir}: no episodes; collect data first")
     return episodes
 
 
@@ -271,9 +263,12 @@ def prepare_latent_data(
     eval_dir: Path,
     autoencoder: Autoencoder,
     device: torch.device,
+    batch_size=WM_BATCH_SIZE,
+    sequence_length=SEQUENCE_LENGTH,
+    amp=False,
 ) -> tuple[DataLoader, DataLoader, Tensor, Tensor]:
-    train_episodes = encode_episodes(train_dir, autoencoder, device)
-    eval_episodes = encode_episodes(eval_dir, autoencoder, device)
+    train_episodes = encode_episodes(train_dir, autoencoder, device, amp)
+    eval_episodes = encode_episodes(eval_dir, autoencoder, device, amp)
 
     train_latents = torch.cat([episode[0] for episode in train_episodes])
     latent_mean = train_latents.mean(dim=0)
@@ -287,23 +282,24 @@ def prepare_latent_data(
         ((latents - latent_mean) / latent_std, actions, rewards, continues)
         for latents, actions, rewards, continues in eval_episodes
     ]
-    train_data = LatentSequenceDataset(train_episodes, SEQUENCE_LENGTH)
-    eval_data = LatentSequenceDataset(eval_episodes, SEQUENCE_LENGTH)
+    train_data = LatentSequenceDataset(train_episodes, sequence_length)
+    eval_data = LatentSequenceDataset(eval_episodes, sequence_length)
 
     print(f"train sequences: {len(train_data)}")
     print(f"eval sequences: {len(eval_data)}")
     return (
         DataLoader(
-            train_data, batch_size=WM_BATCH_SIZE, shuffle=True,
-            num_workers=2, pin_memory=device.type == "cuda",
-            persistent_workers=True,
-            prefetch_factor=4,
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
         ),
         DataLoader(
-            eval_data, batch_size=WM_BATCH_SIZE,
-            num_workers=2, pin_memory=device.type == "cuda",
-            persistent_workers=True,
-            prefetch_factor=4,
+            eval_data,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
         ),
         latent_mean,
         latent_std,
@@ -311,6 +307,7 @@ def prepare_latent_data(
 
 
 # World model
+
 
 def world_model_loss(
     world_model: WorldModel,
@@ -332,7 +329,9 @@ def world_model_loss(
     target_velocity = next_latents - noise
 
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-        velocity, predicted_rewards, continue_logits = world_model(latents, actions, z_tau, tau)
+        velocity, predicted_rewards, continue_logits = world_model(
+            latents, actions, z_tau, tau
+        )
         flow_loss = F.mse_loss(velocity, target_velocity)
         reward_loss = F.mse_loss(predicted_rewards, rewards)
         continue_loss = F.binary_cross_entropy_with_logits(continue_logits, continues)
@@ -356,20 +355,17 @@ def world_model_step(
     )
     loss.backward()
     optimizer.step()
-    return tuple(value.detach() for value in (loss, flow_loss, reward_loss, continue_loss))
+    return tuple(
+        value.detach() for value in (loss, flow_loss, reward_loss, continue_loss)
+    )
 
 
 def sequence_to_device(
     batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
     device: torch.device,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    latents, actions, next_latents, rewards, continues = batch
-    return (
-        latents.to(device, non_blocking=True),
-        actions.to(device, dtype=torch.long, non_blocking=True),
-        next_latents.to(device, non_blocking=True),
-        rewards.to(device, non_blocking=True),
-        continues.to(device, non_blocking=True),
+    return tuple(
+        value.to(device, dtype=torch.float32, non_blocking=True) for value in batch
     )
 
 
@@ -385,7 +381,9 @@ def evaluate_world_model(
     sequence_count = 0
 
     for batch in tqdm(batches, desc="WM eval", unit="batch", leave=False):
-        latents, actions, next_latents, rewards, continues = sequence_to_device(batch, device)
+        latents, actions, next_latents, rewards, continues = sequence_to_device(
+            batch, device
+        )
         losses = world_model_loss(
             world_model, latents, actions, next_latents, rewards, continues, amp
         )
@@ -400,50 +398,54 @@ def evaluate_world_model(
     return tuple(value.item() for value in totals / sequence_count)
 
 
-def train_world_model(game: str) -> None:
+def train_world_model(
+    *,
+    epochs=WM_EPOCHS,
+    batch_size=WM_BATCH_SIZE,
+    sequence_length=SEQUENCE_LENGTH,
+    data_dir=DATA_DIR,
+    artifact_dir=ARTIFACT_DIR,
+) -> None:
     torch.manual_seed(SEED)
     device = choose_device()
     amp = use_amp(device)
+    train_dir, eval_dir = Path(data_dir) / "train", Path(data_dir) / "eval"
+    autoencoder_path = Path(artifact_dir) / "autoencoder.pt"
+    world_model_path = Path(artifact_dir) / "world_model.pt"
     step = prepare_step(partial(world_model_step, amp=amp), device)
-    train_dir, eval_dir, autoencoder_path, world_model_path = game_paths(game)
-    print(f"training {game} world model on {device}")
-
-    state_dict = torch.load(autoencoder_path, map_location=device, weights_only=True)
-    autoencoder = Autoencoder().to(device)
-    autoencoder.load_state_dict(state_dict)
-    autoencoder.eval().requires_grad_(False)
-
+    print(f"training world model on {device}", flush=True)
+    autoencoder = load_autoencoder(autoencoder_path, device)
     train_batches, eval_batches, latent_mean, latent_std = prepare_latent_data(
-        train_dir, eval_dir, autoencoder, device
+        train_dir, eval_dir, autoencoder, device, batch_size, sequence_length, amp
     )
     world_model = WorldModel(
         d_latent=autoencoder.d_latent,
         d_model=D_MODEL,
         n_layer=N_LAYER,
         n_head=N_HEAD,
-        n_action=ACTION_COUNT,
     ).to(device)
     optimizer = Adam(world_model.parameters(), lr=LEARNING_RATE)
     best_eval_loss = float("inf")
 
     # Reuse the first valid eval episode; avoid rebuilding every frame window.
     preview_path = sorted(eval_dir.glob("episode_*.pt"))[eval_batches.dataset.sequences[0][0]]
-    episode = torch.load(preview_path, weights_only=True, mmap=True)
-    preview = (episode["frames"][:SEQUENCE_LENGTH + 1], episode["actions"][:SEQUENCE_LENGTH])
-    preview = (preview[0], preview[1].long())
+    episode = load_episode(preview_path)
+    preview = (episode["frames"][:sequence_length + 1], episode["actions"][:sequence_length])
     with start_run(
-        game, "world_model", world_model_path.parent,
-        epochs=WM_EPOCHS, batch_size=WM_BATCH_SIZE, learning_rate=LEARNING_RATE,
-        sequence_length=SEQUENCE_LENGTH, **world_model.config,
+        "slither", "world_model", world_model_path.parent,
+        epochs=epochs, batch_size=batch_size, learning_rate=LEARNING_RATE,
+        sequence_length=sequence_length, **world_model.config,
         device=str(device), data_dir=str(train_dir.parent), seed=SEED,
     ) as run:
-        for epoch in range(1, WM_EPOCHS + 1):
+        for epoch in range(1, epochs + 1):
             world_model.train()
             totals = torch.zeros(4, device=device)
             sequence_count = 0
 
-            for batch in tqdm(train_batches, desc=f"WM {epoch}/{WM_EPOCHS}", unit="batch"):
-                latents, actions, next_latents, rewards, continues = sequence_to_device(batch, device)
+            for batch in tqdm(train_batches, desc=f"WM {epoch}/{epochs}", unit="batch"):
+                latents, actions, next_latents, rewards, continues = sequence_to_device(
+                    batch, device
+                )
                 losses = step(
                     world_model,
                     latents,
@@ -488,8 +490,10 @@ def train_world_model(game: str) -> None:
                 best_eval_loss = eval_loss
                 torch.save(
                     {
+                        "metadata": metadata(),
+                        "kind": "world_model",
                         "config": world_model.config,
-                        "sequence_length": SEQUENCE_LENGTH,
+                        "sequence_length": sequence_length,
                         "horizon": HORIZON,
                         "solver_steps": SOLVER_STEPS,
                         "latent_mean": latent_mean,
@@ -505,13 +509,33 @@ def train_world_model(game: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("autoencoder", "world", "all"))
-    parser.add_argument("--game", choices=GAMES, default="breakout")
+    parser.add_argument(
+        "--epochs", type=int, help="override epochs for each selected stage"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, help="override batch size for each selected stage"
+    )
+    parser.add_argument("--sequence-length", type=int, default=SEQUENCE_LENGTH)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--artifact-dir", type=Path, default=ARTIFACT_DIR)
     args = parser.parse_args()
-
+    if any(
+        value is not None and value < 1
+        for value in (args.epochs, args.batch_size, args.sequence_length)
+    ):
+        parser.error("epochs, batch-size, and sequence-length must be positive")
+    options = dict(
+        data_dir=args.data_dir,
+        artifact_dir=args.artifact_dir,
+    )
+    if args.epochs is not None:
+        options["epochs"] = args.epochs
+    if args.batch_size is not None:
+        options["batch_size"] = args.batch_size
     if args.command in ("autoencoder", "all"):
-        train_autoencoder(args.game)
+        train_autoencoder(**options)
     if args.command in ("world", "all"):
-        train_world_model(args.game)
+        train_world_model(**options, sequence_length=args.sequence_length)
 
 
 if __name__ == "__main__":

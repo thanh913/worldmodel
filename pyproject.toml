@@ -1,25 +1,39 @@
 [project]
-name = "atari-wm"
+name = "worldmodel"
 version = "0.1.0"
-description = "A small action-conditioned latent world model for Atari"
+description = "Pixel world models for Atari and Slither with separate environment packages"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "ale-py>=0.11",
     "gymnasium>=1.1",
     "matplotlib>=3.9",
     "numpy>=2.0",
+    "numba>=0.59",
+    "pygame-ce>=2.5",
     "torch>=2.5",
     "tqdm>=4.67",
+    "wandb>=0.19",
 ]
 
 [project.scripts]
 atari-wm-data = "atari_wm.data:main"
 atari-wm-train = "atari_wm.train:main"
 atari-wm-eval = "atari_wm.evaluate:main"
+atari-wm-profile = "atari_wm.profile:main"
+slither-wm-data = "slither_wm.data:main"
+slither-wm-train = "slither_wm.train:main"
+slither-wm-eval = "slither_wm.evaluate:main"
+slither-wm-profile = "slither_wm.profile:main"
+slither-play = "slither_cpu.__main__:main"
+slither-bench = "slither_cpu.benchmark:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atari_wm", "src/slither_wm", "src/wm_common", "env/atari_env", "env/slither_cpu"]
 
 [tool.uv]
 required-version = ">=0.8"

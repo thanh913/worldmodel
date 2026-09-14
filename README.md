@@ -10,12 +10,15 @@ A small action-conditioned latent world model for atari (currently implemented B
 
 ```bash
 uv sync
+uv run wandb login
 ```
+
+Training logs epoch losses and evaluation images to W&B project `worldmodel`.
 
 ### Generate data
 
 Recommended params for each env:
-(Generating data will overwrites the old data.)
+(Generating data overwrites the old data.)
 
 ```bash
 uv run atari-wm-data breakout \
@@ -55,3 +58,45 @@ uv run atari-wm-eval breakout --samples 12
 ```
 
 Images are written to `artifacts/<game>/eval/{autoencoder,rollouts}`.
+
+
+## slither_wm
+
+The same world model for Slither: 128×128 RGB with a minimap and continuous turn/boost actions.
+
+### Generate data
+
+```bash
+uv run slither-wm-data
+```
+
+Saves to `data/slither/{train,eval}`. Add `--overwrite` to replace existing data.
+
+### Train
+
+```bash
+uv run slither-wm-train all
+```
+
+Use `autoencoder` or `world` to train one stage.
+
+### Evaluate
+
+```bash
+uv run slither-wm-eval --samples 12
+```
+
+Images are written to `artifacts/slither/eval/{autoencoder,rollouts}`.
+
+### Play
+
+```bash
+uv run slither-play
+```
+
+## Profile
+
+```bash
+uv run atari-wm-profile --game breakout
+uv run slither-wm-profile
+```
