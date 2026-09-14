@@ -13,39 +13,29 @@ from tqdm import tqdm
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from atari_wm.data import GAMES, HorizonDataset
-from atari_wm.models import Autoencoder, WorldModel
+from slither_wm.data import HorizonDataset
+from slither_wm.models import Autoencoder, WorldModel, load_autoencoder
 from wm_common.runtime import choose_device, frames_to_float, use_amp
+from slither_wm.common import (
+    DATA_DIR,
+    ARTIFACT_DIR,
+    SEED,
+    load_checkpoint,
+)
 
 
-DATA_DIR = Path("data")
-ARTIFACT_DIR = Path("artifacts")
-
-ACTION_NAMES = {0: "noop", 1: "fire", 3: "right", 4: "left"}
 DEFAULT_SAMPLE_COUNT = 32
 EVAL_BATCH_SIZE = 4
 DISPLAY_CONTEXT_FRAMES = 2
-SEED = 42
 
 
 def load_models(
-    game: str,
-    device: torch.device,
+    artifact_dir: Path, device: torch.device
 ) -> tuple[Autoencoder, WorldModel, dict]:
-    artifact_dir = ARTIFACT_DIR / game
-
-    autoencoder = Autoencoder().to(device)
-    autoencoder.load_state_dict(
-        torch.load(artifact_dir / "autoencoder.pt", map_location=device, weights_only=True)
-    )
-
-    checkpoint = torch.load(
-        artifact_dir / "world_model.pt", map_location=device, weights_only=True
-    )
+    autoencoder = load_autoencoder(artifact_dir / "autoencoder.pt", device)
+    checkpoint = load_checkpoint(artifact_dir / "world_model.pt", "world_model", device)
     world_model = WorldModel(**checkpoint["config"]).to(device)
     world_model.load_state_dict(checkpoint["state_dict"])
-
-    autoencoder.eval().requires_grad_(False)
     world_model.eval().requires_grad_(False)
     return autoencoder, world_model, checkpoint
 
@@ -77,19 +67,24 @@ def save_comparison(
 
 @torch.inference_mode()
 def evaluate(
-    game: str, sample_count: int, requested_horizon: int | None
+    sample_count=DEFAULT_SAMPLE_COUNT,
+    requested_horizon=None,
+    *,
+    data_dir=DATA_DIR,
+    artifact_dir=ARTIFACT_DIR,
 ) -> None:
     torch.manual_seed(SEED)
     device = choose_device()
     amp = use_amp(device)
-    autoencoder, world_model, checkpoint = load_models(game, device)
+    artifact_dir = Path(artifact_dir)
+    autoencoder, world_model, checkpoint = load_models(artifact_dir, device)
 
     sequence_length = checkpoint["sequence_length"]
     horizon = checkpoint["horizon"] if requested_horizon is None else requested_horizon
     if horizon < 1:
         raise ValueError("horizon must be positive")
 
-    dataset = HorizonDataset(sequence_length, horizon, DATA_DIR / game / "eval")
+    dataset = HorizonDataset(sequence_length, horizon, Path(data_dir) / "eval")
     if sample_count < 1:
         raise ValueError("samples must be positive")
     sample_count = min(sample_count, len(dataset))
@@ -100,7 +95,7 @@ def evaluate(
     latent_std = checkpoint["latent_std"].to(device)
     solver_steps = checkpoint["solver_steps"]
 
-    output_dir = ARTIFACT_DIR / game / "eval"
+    output_dir = artifact_dir / "eval"
     if output_dir.exists():
         shutil.rmtree(output_dir)
     ae_dir = output_dir / "autoencoder"
@@ -108,10 +103,11 @@ def evaluate(
     ae_dir.mkdir(parents=True)
     rollout_dir.mkdir()
 
+    display_context = min(DISPLAY_CONTEXT_FRAMES, sequence_length)
     offset = 0
     for frames, actions in tqdm(batches, desc="Eval images", unit="batch"):
         frames = frames_to_float(frames, device)
-        actions = actions.to(device=device, dtype=torch.long)
+        actions = actions.to(device=device, dtype=torch.float32)
         batch_size = len(frames)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
@@ -133,10 +129,16 @@ def evaluate(
                 predictions.append(z_next)
                 history_latents = torch.cat((history_latents, z_next[:, None]), dim=1)
 
-            predicted_latents = torch.stack(predictions, dim=1) * latent_std + latent_mean
+            predicted_latents = (
+                torch.stack(predictions, dim=1) * latent_std + latent_mean
+            )
             predicted_frames = autoencoder.decode(predicted_latents.flatten(0, 1))
-            predicted_frames = predicted_frames.reshape(batch_size, horizon, *frames.shape[2:])
-            reconstructed = autoencoder.decode(autoencoder.encode(context_frames[:, -1]))
+            predicted_frames = predicted_frames.reshape(
+                batch_size, horizon, *frames.shape[2:]
+            )
+            reconstructed = autoencoder.decode(
+                autoencoder.encode(context_frames[:, -1])
+            )
 
         frames = frames.cpu()
         reconstructed = reconstructed.float().cpu()
@@ -152,13 +154,11 @@ def evaluate(
                 ae_dir / f"index_{index:06d}.png",
             )
 
-            truth = frames[row, sequence_length - DISPLAY_CONTEXT_FRAMES :]
-            prediction = torch.cat(
-                (truth[:DISPLAY_CONTEXT_FRAMES], predicted_frames[row])
-            )
-            titles = [f"context {i + 1}" for i in range(DISPLAY_CONTEXT_FRAMES)]
+            truth = frames[row, sequence_length - display_context :]
+            prediction = torch.cat((truth[:display_context], predicted_frames[row]))
+            titles = [f"context {i + 1}" for i in range(display_context)]
             titles += [
-                f"t+{step + 1}\n{ACTION_NAMES.get(int(action), str(int(action)))}"
+                f"t+{step + 1}\nturn {action[0]:+.2f}\nboost {action[1]:.2f}"
                 for step, action in enumerate(future_actions[row])
             ]
             save_comparison(
@@ -169,17 +169,23 @@ def evaluate(
             )
         offset += batch_size
 
-    print(f"evaluated {sample_count} {game} samples with horizon {horizon} on {device}")
+    print(f"evaluated {sample_count} samples with horizon {horizon} on {device}")
     print(f"saved images to {output_dir}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("game", choices=GAMES)
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--horizon", type=int)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--artifact-dir", type=Path, default=ARTIFACT_DIR)
     args = parser.parse_args()
-    evaluate(args.game, args.samples, args.horizon)
+    evaluate(
+        args.samples,
+        args.horizon,
+        data_dir=args.data_dir,
+        artifact_dir=args.artifact_dir,
+    )
 
 
 if __name__ == "__main__":

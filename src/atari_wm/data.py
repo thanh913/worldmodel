@@ -8,19 +8,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from ale_py.vector_env import AtariVectorEnv
-from gymnasium.vector import AutoresetMode
+from atari_env import ATARI_ACTIONS, FIRE, GAMES, make_env
 from tqdm import tqdm
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_DIR / "data"
-ATARI_ACTIONS = (0, 1, 3, 4)  # noop, fire, right, left
-FIRE = 1
-FRAME_SHAPE = (128, 96)
-FRAME_SKIP = 4
+DATA_DIR = Path("data")
 MAX_AUTO_ENVS = 8
-GAMES = ("breakout", "pong")
 
 
 @dataclass
@@ -69,23 +62,7 @@ def generate_split(game, output_dir, episode_count, max_steps, base_seed, num_en
 
     lane_limit = num_envs or min(MAX_AUTO_ENVS, os.cpu_count() or 1)
     lane_count = min(lane_limit, episode_count)
-    height, width = FRAME_SHAPE
-    env = AtariVectorEnv(
-        game,
-        num_envs=lane_count,
-        num_threads=lane_count,
-        autoreset_mode=AutoresetMode.NEXT_STEP,
-        max_num_frames_per_episode=max_steps * FRAME_SKIP,
-        full_action_space=True,
-        img_height=height,
-        img_width=width,
-        grayscale=False,
-        stack_num=1,
-        frameskip=FRAME_SKIP,
-        maxpool=False,
-        noop_max=0,
-        use_fire_reset=False,
-    )
+    env = make_env(game, lane_count, max_steps)
 
     active = [new_episode(index, base_seed) for index in range(lane_count)]
     next_episode = lane_count
@@ -193,13 +170,19 @@ class HorizonDataset(torch.utils.data.Dataset):
 class FrameDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir):
         self.frames = HorizonDataset(context=1, horizon=0, data_dir=data_dir)
+        self._arrays = [frames.numpy() for frames, _ in self.frames.episodes]
 
     def __len__(self):
         return len(self.frames)
 
     def __getitem__(self, index):
-        frames, _ = self.frames[index]
-        return frames[0]
+        episode, offset = self.frames.windows[index]
+        return self.frames.episodes[episode][0][offset]
+
+    def __getitems__(self, indices):
+        """Let DataLoader fetch a batch without creating per-frame tensor views."""
+        return [self._arrays[episode][offset] for episode, offset in
+                (self.frames.windows[index] for index in indices)]
 
 
 def main():
