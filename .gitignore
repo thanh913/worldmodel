@@ -12,3 +12,7 @@ dist/
 build/
 *.egg-info/
 wandb/
+
+# Local profiling scripts
+/src/atari_wm/profile.py
+/src/slither_wm/profile.py
