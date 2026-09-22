@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "ale-py>=0.11",
     "gymnasium>=1.1",
+    "lpips>=0.1.4",
     "matplotlib>=3.9",
     "numpy>=2.0",
     "numba>=0.59",
@@ -20,11 +21,9 @@ dependencies = [
 atari-wm-data = "atari_wm.data:main"
 atari-wm-train = "atari_wm.train:main"
 atari-wm-eval = "atari_wm.evaluate:main"
-atari-wm-profile = "atari_wm.profile:main"
 slither-wm-data = "slither_wm.data:main"
 slither-wm-train = "slither_wm.train:main"
 slither-wm-eval = "slither_wm.evaluate:main"
-slither-wm-profile = "slither_wm.profile:main"
 slither-play = "slither_cpu.__main__:main"
 slither-bench = "slither_cpu.benchmark:main"
 
@@ -33,7 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/atari_wm", "src/slither_wm", "src/wm_common", "env/atari_env", "env/slither_cpu"]
+packages = ["src/atari_wm", "src/slither_wm", "env/atari_env", "env/slither_cpu"]
 
 [tool.uv]
 required-version = ">=0.8"

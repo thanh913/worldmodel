@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 from slither_wm.data import HorizonDataset
 from slither_wm.models import Autoencoder, WorldModel, load_autoencoder
-from wm_common.runtime import choose_device, frames_to_float, use_amp
+from slither_wm.train import choose_device, frames_to_float, use_amp
 from slither_wm.common import (
     DATA_DIR,
     ARTIFACT_DIR,

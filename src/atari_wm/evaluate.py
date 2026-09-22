@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 from atari_wm.data import GAMES, HorizonDataset
 from atari_wm.models import Autoencoder, WorldModel
-from wm_common.runtime import choose_device, frames_to_float, use_amp
+from atari_wm.train import choose_device, frames_to_float, use_amp
 
 
 DATA_DIR = Path("data")

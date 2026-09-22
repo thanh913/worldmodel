@@ -1,10 +1,7 @@
 # WM
 
-WM experimenting repo.
-
-
-## atari_wm
-A small action-conditioned latent world model for atari (currently implemented Breakout and Pong.)
+Experiments with action-conditioned latent world models for Atari (Breakout and
+Pong) and Slither. Each environment has its own data, model, and training code.
 
 ## Setup
 
@@ -13,90 +10,80 @@ uv sync
 uv run wandb login
 ```
 
-Training logs epoch losses and evaluation images to W&B project `worldmodel`.
+Training logs losses and evaluation images to the W&B project `worldmodel`.
 
-### Generate data
+## Workflow
 
-Recommended params for each env:
-(Generating data overwrites the old data.)
-
-```bash
-uv run atari-wm-data breakout \
-  --train-episodes 2000 \
-  --eval-episodes 30 \
-  --max-steps 2000 \
-  --num-envs 8
-
-uv run atari-wm-data pong \
-  --train-episodes 400 \
-  --eval-episodes 10 \
-  --max-steps 2000 \
-  --num-envs 8
+```text
+generate -> preprocess frames -> train AE -> encode latents -> train WM
 ```
 
-Data collection runs several native ALE environments in parallel. Omit
-`--num-envs` to use up to 8 CPU lanes automatically.
+Each command runs one stage. Rerun the affected downstream stages after changing
+data or the autoencoder; artifacts are never rebuilt automatically. Changing the
+world model's sequence length also requires rerunning `encode`.
 
+### Atari
 
-### Train
+Use `breakout` or `pong`:
 
 ```bash
+uv run atari-wm-data generate breakout
+uv run atari-wm-data preprocess breakout
 uv run atari-wm-train autoencoder --game breakout
+uv run atari-wm-train encode --game breakout
 uv run atari-wm-train world --game breakout
 ```
 
-To train both stages in sequence:
+### Slither
+
+Slither uses 128×128 RGB frames with a minimap and continuous turn/boost actions.
 
 ```bash
-uv run atari-wm-train all --game breakout
+uv run slither-wm-data generate
+uv run slither-wm-data preprocess
+uv run slither-wm-train autoencoder
+uv run slither-wm-train encode
+uv run slither-wm-train world
 ```
 
-### Evaluate
+For a custom Slither window length, pass the same `--sequence-length` to `encode`
+and `world`.
+
+Scale data collection with `--train-episodes`, `--eval-episodes`, `--max-steps`,
+and `--num-envs`. Atari generation replaces existing data; Slither requires
+`--overwrite` to do so. Use each command's `--help` for more options.
+
+## Data and training
+
+Paths use `<env>` = `breakout`, `pong`, or `slither`:
+
+| Path | Contents |
+| --- | --- |
+| `data/<env>/{train,eval}/episode_*.pt` | Trajectories: frames, actions, rewards, and continues |
+| `data/<env>/{train,eval}/frames.npy` | Shuffled uint8 frames, read in batches using mmap |
+| `artifacts/<env>/autoencoder.pt` | Trained autoencoder |
+| `artifacts/<env>/latent_data.pt` | Normalized latent trajectories and valid sequence windows |
+| `artifacts/<env>/world_model.pt` | Trained world model |
+
+A trajectory has `T+1` frames and `T` transitions. Train and evaluation data stay
+separate, latent normalization uses training data only, and sequence windows
+never cross episode boundaries.
+
+Both autoencoders use `L1 + LPIPS_WEIGHT * LPIPS`. Adjust `LPIPS_WEIGHT` (default
+`0.1`) in the environment's `train.py`. LPIPS weights are frozen and downloaded
+on first use; training uses BF16 mixed precision on supported GPUs. L1, LPIPS,
+and total loss are logged separately, and total validation loss selects the best
+autoencoder checkpoint.
+
+## Evaluate and play
+
+After training both models, render reconstructions and rollouts:
 
 ```bash
 uv run atari-wm-eval breakout --samples 12
-```
-
-Images are written to `artifacts/<game>/eval/{autoencoder,rollouts}`.
-
-
-## slither_wm
-
-The same world model for Slither: 128×128 RGB with a minimap and continuous turn/boost actions.
-
-### Generate data
-
-```bash
-uv run slither-wm-data
-```
-
-Saves to `data/slither/{train,eval}`. Add `--overwrite` to replace existing data.
-
-### Train
-
-```bash
-uv run slither-wm-train all
-```
-
-Use `autoencoder` or `world` to train one stage.
-
-### Evaluate
-
-```bash
 uv run slither-wm-eval --samples 12
 ```
 
-Images are written to `artifacts/slither/eval/{autoencoder,rollouts}`.
+Images are saved to `artifacts/<env>/eval/{autoencoder,rollouts}`.
 
-### Play
-
-```bash
-uv run slither-play
-```
-
-## Profile
-
-```bash
-uv run atari-wm-profile --game breakout
-uv run slither-wm-profile
-```
+Play Slither with `uv run slither-play`.
